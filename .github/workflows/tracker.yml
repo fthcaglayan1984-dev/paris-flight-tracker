@@ -1,0 +1,41 @@
+name: Uçak Bileti Takip Sistemi
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+    - cron: '0 12 * * *'
+    - cron: '0 18 * * *'
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-tracker:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Kodu Klonla
+        uses: actions/checkout@v4
+        
+      - name: Python Kurulumu
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Bağımlılıkları Yükle
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps
+          
+      - name: Çalıştır
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python tracker.py
+        
+      - name: Debug Dosyalarını Yükle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-files
+          path: debug/
