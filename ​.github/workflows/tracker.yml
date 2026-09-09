@@ -1,31 +1,1768 @@
-name: Paris Flight Tracker Automated
+import os
+import re
+import json
+import asyncio
+from pathlib import Path
+from datetime import datetime
+from urllib.parse import quote
 
-on:
-  schedule:
-    # TSİ ile Günde 4 Defa Çalışır: 02:00, 08:00, 14:00, 20:00
-    - cron: '0 23,5,11,17 * * *'
-  workflow_dispatch:
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from telegram import Bot
 
-jobs:
-  run-tracker:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Depoyu Klonla
-        uses: actions/checkout@v4
 
-      - name: Python Ortamını Kur
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+# ============================================================
+# 1. AYARLAR
+# ============================================================
 
-      - name: Gerekli Kütüphaneleri Yükle
-        run: |
-          python -m pip install --upgrade pip
-          pip install playwright python-telegram-bot
-          playwright install chromium --with-deps
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-      - name: Tarama Kodunu Çalıştır
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python main.py
+DATA_DIR = Path("flight_data")
+DATA_DIR.mkdir(exist_ok=True)
+
+HISTORY_FILE = DATA_DIR / "price_history.json"
+LAST_RESULTS_FILE = DATA_DIR / "last_results.json"
+DEBUG_DIR = DATA_DIR / "debug"
+DEBUG_DIR.mkdir(exist_ok=True)
+
+
+# ============================================================
+# 2. SEYAHAT BİLGİLERİ
+# ============================================================
+
+# ANA TARİH
+MAIN_DEPARTURE = "2026-10-17"
+MAIN_RETURN = "2026-11-01"
+
+# GİDİŞ ALTERNATİFLERİ
+DEPARTURE_DATES = [
+    "2026-10-15",
+    "2026-10-16",
+    "2026-10-17",
+    "2026-10-18",
+]
+
+# DÖNÜŞ ALTERNATİFLERİ
+RETURN_DATES = [
+    "2026-10-29",
+    "2026-11-01",
+    "2026-11-03",
+]
+
+
+# ============================================================
+# 3. KALKIŞ HAVALİMANLARI
+# ============================================================
+
+ORIGINS = {
+    "Ankara": ["ESB"],
+    "İstanbul": ["IST", "SAW"],
+    "Antalya": ["AYT"],
+    "İzmir": ["ADB"],
+    "Denizli": ["DNZ"],
+}
+
+
+# PARİS'TE TÜM ÖNEMLİ HAVALİMANLARI
+DESTINATIONS = [
+    "CDG",
+    "ORY",
+    "BVA",
+]
+
+
+# ============================================================
+# 4. AKTARMA ŞEHİRLERİ
+# ============================================================
+
+# Bunlar özellikle raporda aranacak.
+# Google Flights sonuçlarında görülürse işaretlenecek.
+
+TRANSFER_CITIES = [
+    "Istanbul",
+    "İstanbul",
+
+    "Frankfurt",
+    "Frankfurt am Main",
+
+    "Munich",
+    "München",
+    "Munich",
+
+    "Berlin",
+
+    "Dusseldorf",
+    "Düsseldorf",
+
+    "Cologne",
+    "Köln",
+
+    "Vienna",
+    "Viyana",
+
+    "Zurich",
+    "Zürich",
+
+    "Amsterdam",
+
+    "Warsaw",
+    "Varşova",
+
+    "Prague",
+    "Prag",
+
+    "Belgrade",
+    "Belgrad",
+
+    "Athens",
+    "Atina",
+
+    "Milan",
+    "Milano",
+
+    "Rome",
+    "Roma",
+
+    "Copenhagen",
+    "Kopenhag",
+
+    "Brussels",
+    "Brüksel",
+
+    "Paris",
+]
+
+
+# ============================================================
+# 5. HAVAYOLLARI
+# ============================================================
+
+AIRLINES = [
+    "Pegasus",
+    "AJet",
+    "Turkish Airlines",
+    "Türk Hava Yolları",
+    "Lufthansa",
+    "Air France",
+    "KLM",
+    "Eurowings",
+    "SunExpress",
+    "Aegean",
+    "Austrian",
+    "SWISS",
+    "LOT",
+    "Air Serbia",
+    "Ryanair",
+    "Wizz Air",
+    "easyJet",
+    "ITA Airways",
+    "British Airways",
+    "Brussels Airlines",
+]
+
+
+# ============================================================
+# 6. YARDIMCI FONKSİYONLAR
+# ============================================================
+
+def now_string():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def load_json(path, default):
+    if not path.exists():
+        return default
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+
+def money_text(price):
+    if price is None:
+        return "Bilinmiyor"
+
+    return f"{price:,.0f} TL".replace(",", ".")
+
+
+def parse_price(text):
+    """
+    Google Flights / Turna / farklı para gösterimlerini
+    mümkün olduğunca TL sayısına dönüştürür.
+
+    Not:
+    Google Flights başka para biriminde açılırsa bunu
+    TL olarak çevirmeye çalışmaz; currency filtresi
+    aşağıda TRY olarak ayarlanmıştır.
+    """
+
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # TL / TRY / ₺
+    if not any(x in text.upper() for x in ["TL", "TRY", "₺"]):
+        return None
+
+    # 12.345 TL
+    m = re.search(
+        r"(\d{1,3}(?:\.\d{3})+)\s*(?:TL|TRY|₺)",
+        text,
+        re.I
+    )
+
+    if m:
+        try:
+            return int(m.group(1).replace(".", ""))
+        except:
+            pass
+
+    # 12345 TL
+    m = re.search(
+        r"(\d{4,7})\s*(?:TL|TRY|₺)",
+        text,
+        re.I
+    )
+
+    if m:
+        try:
+            return int(m.group(1))
+        except:
+            pass
+
+    return None
+
+
+def parse_duration(text):
+    if not text:
+        return None
+
+    text = text.lower()
+
+    hours = 0
+    minutes = 0
+
+    h = re.search(
+        r"(\d+)\s*(?:sa|saat|h)",
+        text
+    )
+
+    m = re.search(
+        r"(\d+)\s*(?:dk|dakika|min|m)",
+        text
+    )
+
+    if h:
+        hours = int(h.group(1))
+
+    if m:
+        minutes = int(m.group(1))
+
+    total = hours * 60 + minutes
+
+    return total if total else None
+
+
+def format_duration(minutes):
+    if minutes is None:
+        return "Bilinmiyor"
+
+    hours = minutes // 60
+    mins = minutes % 60
+
+    if hours:
+        return f"{hours}s {mins}dk"
+
+    return f"{mins}dk"
+
+
+def detect_stops(text):
+    if not text:
+        return None
+
+    t = text.lower()
+
+    if "nonstop" in t or "direct" in t or "direkt" in t:
+        return 0
+
+    patterns = [
+        r"(\d+)\s*stop",
+        r"(\d+)\s*aktarma",
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, t)
+
+        if m:
+            try:
+                return int(m.group(1))
+            except:
+                pass
+
+    if "1 stop" in t:
+        return 1
+
+    if "2 stops" in t:
+        return 2
+
+    if "2 aktarma" in t:
+        return 2
+
+    if "1 aktarma" in t:
+        return 1
+
+    return None
+
+
+def detect_airline(text):
+    if not text:
+        return "Bilinmiyor"
+
+    lower = text.lower()
+
+    for airline in AIRLINES:
+
+        if airline.lower() in lower:
+            return airline
+
+    return "Bilinmiyor"
+
+
+def detect_transfer(text):
+    if not text:
+        return None
+
+    lower = text.lower()
+
+    found = []
+
+    for city in TRANSFER_CITIES:
+
+        if city.lower() in lower:
+            if city not in found:
+                found.append(city)
+
+    if found:
+        return ", ".join(found[:3])
+
+    return None
+
+
+def baggage_info(text):
+    if not text:
+        return "Bilinmiyor"
+
+    t = text.lower()
+
+    if "no checked bag" in t:
+        return "Kayıtlı bagaj yok"
+
+    if "checked bag" in t:
+        return "Kayıtlı bagaj mevcut"
+
+    if "bagaj dahil" in t:
+        return "Bagaj dahil"
+
+    if "bagajsız" in t:
+        return "Bagajsız"
+
+    kg = re.findall(
+        r"(\d+)\s*kg",
+        t
+    )
+
+    if kg:
+        return f"{kg[0]} kg"
+
+    return "Bilgi yok"
+
+
+# ============================================================
+# 7. GOOGLE FLIGHTS URL
+# ============================================================
+
+def google_flights_url(
+    origin,
+    destination,
+    departure,
+    return_date
+):
+    """
+    Google Flights arama URL'si.
+
+    q parametresi insan okunabilir bir uçuş sorgusu
+    oluşturur.
+    """
+
+    query = (
+        f"Flights from {origin} to {destination} "
+        f"on {departure} through {return_date}"
+    )
+
+    return (
+        "https://www.google.com/travel/flights?"
+        f"q={quote(query)}"
+        "&hl=tr"
+        "&curr=TRY"
+    )
+
+
+# ============================================================
+# 8. TURNА URL
+# ============================================================
+
+def turna_url(
+    origin,
+    destination,
+    departure,
+    return_date
+):
+    """
+    Turna'nın rota URL'sini oluşturur.
+
+    Turna URL yapısı zaman içinde değişebildiği için
+    Google Flights bağlantısı ana güvenilir arama linkidir.
+    """
+
+    return (
+        "https://www.turna.com/ucak-bileti/"
+        f"{origin.lower()}-{destination.lower()}"
+        f"?departureDate={departure}"
+        f"&returnDate={return_date}"
+    )
+
+
+# ============================================================
+# 9. GOOGLE FLIGHTS SAYFASINI AÇ
+# ============================================================
+
+async def open_flights_page(
+    page,
+    url
+):
+    try:
+
+        await page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=90000
+        )
+
+        # Google Flights dinamik sonuçları bekle
+        await page.wait_for_timeout(7000)
+
+        # Sayfayı aşağı kaydır
+        for _ in range(5):
+
+            await page.mouse.wheel(
+                0,
+                1200
+            )
+
+            await page.wait_for_timeout(700)
+
+        return True
+
+    except PlaywrightTimeoutError:
+
+        print(
+            "Google Flights timeout:",
+            url
+        )
+
+        return False
+
+    except Exception as e:
+
+        print(
+            "Google Flights hata:",
+            e
+        )
+
+        return False
+
+
+# ============================================================
+# 10. GOOGLE FLIGHTS SONUÇLARINI OKU
+# ============================================================
+
+async def extract_google_results(
+    page,
+    origin,
+    destination,
+    departure,
+    return_date
+):
+
+    results = []
+
+    body_text = ""
+
+    try:
+        body_text = await page.locator(
+            "body"
+        ).inner_text()
+
+    except Exception:
+        return results
+
+    # --------------------------------------------------------
+    # DEBUG
+    # --------------------------------------------------------
+
+    debug_name = (
+        f"{origin}_{destination}_"
+        f"{departure}_{return_date}"
+        .replace("/", "-")
+    )
+
+    try:
+
+        with open(
+            DEBUG_DIR / f"{debug_name}.txt",
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            f.write(body_text)
+
+    except:
+        pass
+
+    # --------------------------------------------------------
+    # SATIRLAR
+    # --------------------------------------------------------
+
+    lines = [
+        line.strip()
+        for line in body_text.splitlines()
+        if line.strip()
+    ]
+
+    # --------------------------------------------------------
+    # FİYAT SATIRLARINI BUL
+    # --------------------------------------------------------
+
+    price_positions = []
+
+    for i, line in enumerate(lines):
+
+        price = parse_price(line)
+
+        if price:
+
+            # Gerçek uçuş fiyatı olması muhtemel aralık
+            if 1000 <= price <= 500000:
+
+                price_positions.append(
+                    (i, price)
+                )
+
+    # --------------------------------------------------------
+    # FİYAT ETRAFINDAKİ BİLGİLERİ BİRLEŞTİR
+    # --------------------------------------------------------
+
+    for index, (position, price) in enumerate(
+        price_positions
+    ):
+
+        start = max(
+            0,
+            position - 10
+        )
+
+        end = min(
+            len(lines),
+            position + 8
+        )
+
+        block = "\n".join(
+            lines[start:end]
+        )
+
+        # Uçuşa ait olma ihtimalini artır
+        if not any(
+            x.lower() in block.lower()
+            for x in AIRLINES
+        ):
+
+            # Havayolu görünmüyorsa da fiyatı atma
+            pass
+
+        airline = detect_airline(
+            block
+        )
+
+        stops = detect_stops(
+            block
+        )
+
+        transfer = detect_transfer(
+            block
+        )
+
+        duration = None
+
+        # Blok içindeki süreleri ara
+        duration_matches = re.findall(
+            r"(\d+\s*(?:sa|saat|h)"
+            r"(?:\s*\d+\s*(?:dk|dakika|min|m))?)",
+            block.lower()
+        )
+
+        if duration_matches:
+
+            durations = [
+                parse_duration(x)
+                for x in duration_matches
+            ]
+
+            durations = [
+                x for x in durations
+                if x
+            ]
+
+            if durations:
+                duration = max(durations)
+
+        baggage = baggage_info(
+            block
+        )
+
+        # ----------------------------------------------------
+        # AYNI FİYATI TEKRAR ALMA
+        # ----------------------------------------------------
+
+        duplicate = False
+
+        for old in results:
+
+            if (
+                old["price"] == price
+                and old["airline"] == airline
+                and old["stops"] == stops
+            ):
+
+                duplicate = True
+                break
+
+        if duplicate:
+            continue
+
+        result = {
+            "source": "Google Flights",
+            "origin": origin,
+            "destination": destination,
+            "departure": departure,
+            "return": return_date,
+
+            "price": price,
+
+            "airline": airline,
+
+            "stops": stops,
+
+            "transfer": transfer,
+
+            "duration": duration,
+
+            "baggage": baggage,
+
+            "search_url": google_flights_url(
+                origin,
+                destination,
+                departure,
+                return_date
+            ),
+
+            "raw": block[:1500],
+
+            "checked_at": now_string()
+        }
+
+        results.append(result)
+
+    # En ucuz ilk
+    results.sort(
+        key=lambda x: x["price"]
+    )
+
+    # Aynı aramadan çok fazla sonuç alma
+    return results[:20]
+
+
+# ============================================================
+# 11. TURNА KONTROLÜ
+# ============================================================
+
+async def check_turna(
+    page,
+    origin,
+    destination,
+    departure,
+    return_date
+):
+
+    url = turna_url(
+        origin,
+        destination,
+        departure,
+        return_date
+    )
+
+    result = {
+        "source": "Turna",
+        "origin": origin,
+        "destination": destination,
+        "departure": departure,
+        "return": return_date,
+        "price": None,
+        "url": url,
+        "checked_at": now_string()
+    }
+
+    try:
+
+        await page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=60000
+        )
+
+        await page.wait_for_timeout(
+            7000
+        )
+
+        body = await page.locator(
+            "body"
+        ).inner_text()
+
+        prices = []
+
+        for line in body.splitlines():
+
+            price = parse_price(
+                line
+            )
+
+            if price and 1000 <= price <= 500000:
+
+                prices.append(
+                    price
+                )
+
+        if prices:
+
+            result["price"] = min(
+                prices
+            )
+
+    except Exception as e:
+
+        print(
+            "Turna hata:",
+            origin,
+            e
+        )
+
+    return result
+
+
+# ============================================================
+# 12. FİYAT GEÇMİŞİ
+# ============================================================
+
+def history_key(result):
+
+    return "|".join([
+        result["source"],
+        result["origin"],
+        result["destination"],
+        result["departure"],
+        result["return"],
+        result.get("airline", ""),
+        str(result.get("stops", ""))
+    ])
+
+
+def update_history(result):
+
+    if result.get("price") is None:
+        return None
+
+    history = load_json(
+        HISTORY_FILE,
+        {}
+    )
+
+    key = history_key(
+        result
+    )
+
+    today = datetime.now().strftime(
+        "%Y-%m-%d"
+    )
+
+    if key not in history:
+
+        history[key] = {
+            "route": result["origin"],
+            "destination": result["destination"],
+            "airline": result.get("airline"),
+            "prices": {}
+        }
+
+    prices = history[key]["prices"]
+
+    previous_dates = [
+        x for x in prices
+        if x < today
+    ]
+
+    previous_price = None
+
+    if previous_dates:
+
+        previous_date = sorted(
+            previous_dates
+        )[-1]
+
+        previous_price = prices[
+            previous_date
+        ]
+
+    prices[today] = result["price"]
+
+    save_json(
+        HISTORY_FILE,
+        history
+    )
+
+    if previous_price is None:
+        return {
+            "status": "new",
+            "previous": None,
+            "difference": None,
+            "percentage": None
+        }
+
+    difference = (
+        result["price"] -
+        previous_price
+    )
+
+    percentage = (
+        difference /
+        previous_price
+    ) * 100
+
+    return {
+        "status": "changed",
+        "previous": previous_price,
+        "difference": difference,
+        "percentage": percentage
+    }
+
+
+# ============================================================
+# 13. FİYAT DEĞİŞİM METNİ
+# ============================================================
+
+def price_change_text(change):
+
+    if not change:
+        return ""
+
+    if change["status"] == "new":
+
+        return "🆕 İlk kayıt"
+
+    previous = change["previous"]
+    difference = change["difference"]
+    percentage = change["percentage"]
+
+    if difference < 0:
+
+        return (
+            f"📉 Dün: {money_text(previous)}\n"
+            f"🟢 Bugün: {money_text(previous + difference)}\n"
+            f"⬇️ {money_text(abs(difference))} "
+            f"(%{abs(percentage):.1f}) ucuzladı"
+        )
+
+    if difference > 0:
+
+        return (
+            f"📅 Önceki: {money_text(previous)}\n"
+            f"🔴 Bugün: "
+            f"{money_text(previous + difference)}\n"
+            f"⬆️ {money_text(difference)} "
+            f"(%{percentage:.1f}) arttı"
+        )
+
+    return (
+        f"➡️ Fiyat değişmedi: "
+        f"{money_text(previous)}"
+    )
+
+
+# ============================================================
+# 14. SONUÇLARI PUANLA
+# ============================================================
+
+def score_flight(flight):
+
+    price = flight.get("price") or 999999
+
+    stops = flight.get("stops")
+
+    duration = flight.get("duration")
+
+    score = price
+
+    # Aktarmaya ceza
+    if stops == 1:
+        score += 500
+
+    elif stops == 2:
+        score += 1000
+
+    elif stops and stops >= 3:
+        score += 2000
+
+    # Çok uzun yolculuğa ceza
+    if duration:
+
+        if duration > 900:
+            score += 2500
+
+        elif duration > 720:
+            score += 1500
+
+        elif duration > 600:
+            score += 750
+
+    return score
+
+
+# ============================================================
+# 15. ANA ARAŞTIRMA
+# ============================================================
+
+async def research():
+
+    all_results = []
+
+    async with async_playwright() as p:
+
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage"
+            ]
+        )
+
+        context = await browser.new_context(
+
+            viewport={
+                "width": 1440,
+                "height": 1000
+            },
+
+            locale="tr-TR",
+
+            user_agent=(
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/140.0.0.0 "
+                "Safari/537.36"
+            )
+        )
+
+        page = await context.new_page()
+
+        # ====================================================
+        # TARİHLER
+        # ====================================================
+
+        for departure in DEPARTURE_DATES:
+
+            for return_date in RETURN_DATES:
+
+                # =================================================
+                # KALKIŞ ŞEHİRLERİ
+                # =================================================
+
+                for city, airports in ORIGINS.items():
+
+                    for airport in airports:
+
+                        # Paris havalimanlarının tamamını kontrol et
+                        for paris_airport in DESTINATIONS:
+
+                            print(
+                                f"🔎 {airport} → "
+                                f"{paris_airport} | "
+                                f"{departure} → "
+                                f"{return_date}"
+                            )
+
+                            url = google_flights_url(
+                                airport,
+                                paris_airport,
+                                departure,
+                                return_date
+                            )
+
+                            ok = await open_flights_page(
+                                page,
+                                url
+                            )
+
+                            if not ok:
+                                continue
+
+                            flights = await extract_google_results(
+                                page,
+                                airport,
+                                paris_airport,
+                                departure,
+                                return_date
+                            )
+
+                            all_results.extend(
+                                flights
+                            )
+
+                            # Google'a fazla hızlı yüklenme
+                            await asyncio.sleep(2)
+
+        # ====================================================
+        # ANA TARİH İÇİN TURNA KONTROLÜ
+        # ====================================================
+
+        # Turna'yı bütün 60 kombinasyonda çalıştırmak yerine
+        # ana tarihleri kontrol ediyoruz.
+        #
+        # Böylece günlük sistem çok daha hızlı çalışır.
+
+        for city, airports in ORIGINS.items():
+
+            for airport in airports:
+
+                print(
+                    f"🔵 Turna kontrolü: "
+                    f"{airport}"
+                )
+
+                turna_result = await check_turna(
+                    page,
+                    airport,
+                    "PAR",
+                    MAIN_DEPARTURE,
+                    MAIN_RETURN
+                )
+
+                if turna_result["price"]:
+
+                    turna_result["airline"] = "Turna"
+
+                    turna_result["stops"] = None
+
+                    turna_result["duration"] = None
+
+                    turna_result["transfer"] = None
+
+                    turna_result["baggage"] = (
+                        "Detay sayfasından kontrol"
+                    )
+
+                    all_results.append(
+                        turna_result
+                    )
+
+        await browser.close()
+
+    return all_results
+
+
+# ============================================================
+# 16. DUPLICATE TEMİZLE
+# ============================================================
+
+def clean_results(results):
+
+    unique = {}
+
+    for result in results:
+
+        price = result.get("price")
+
+        if not price:
+            continue
+
+        key = (
+            result.get("source"),
+            result.get("origin"),
+            result.get("destination"),
+            result.get("departure"),
+            result.get("return"),
+            result.get("airline"),
+            price,
+            result.get("stops"),
+        )
+
+        unique[key] = result
+
+    results = list(
+        unique.values()
+    )
+
+    return results
+
+
+# ============================================================
+# 17. FİYAT GEÇMİŞİNİ GÜNCELLE
+# ============================================================
+
+def process_history(results):
+
+    for result in results:
+
+        result["price_change"] = (
+            update_history(result)
+        )
+
+    return results
+
+
+# ============================================================
+# 18. ANA RAPOR
+# ============================================================
+
+def build_report(results):
+
+    if not results:
+
+        return (
+            "⚠️ *Hiç fiyat okunamadı.*\n\n"
+            "Tarama tamamlandı ancak kaynaklardan "
+            "fiyat bilgisi alınamadı.\n\n"
+            "Debug dosyaları flight_data/debug "
+            "klasörüne kaydedildi."
+        )
+
+    results.sort(
+        key=score_flight
+    )
+
+    lines = []
+
+    lines.append(
+        "✈️ *GÜNLÜK PARİS UÇAK BİLETİ RAPORU*"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "🎯 *Ana tarih:* "
+        "17 Ekim 2026 → 1 Kasım 2026"
+    )
+
+    lines.append(
+        "🔎 *Alternatif gidiş:* "
+        "15 / 16 / 17 / 18 Ekim"
+    )
+
+    lines.append(
+        "🔎 *Alternatif dönüş:* "
+        "29 Ekim / 1 / 3 Kasım"
+    )
+
+    lines.append("")
+
+    lines.append(
+        f"📊 Okunan fiyatlı seçenek: "
+        f"*{len(results)}*"
+    )
+
+    lines.append(
+        "🌍 Direkt + Türkiye aktarmalı + "
+        "Avrupa aktarmalı seçenekler tarandı."
+    )
+
+    lines.append("")
+
+    lines.append(
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    # ========================================================
+    # EN UCUZ 10
+    # ========================================================
+
+    for i, result in enumerate(
+        results[:10],
+        1
+    ):
+
+        lines.append("")
+
+        lines.append(
+            f"*{i}. {result['origin']} → "
+            f"{result['destination']}*"
+        )
+
+        lines.append(
+            f"💰 *{money_text(result['price'])}*"
+        )
+
+        lines.append(
+            f"🏷 {result.get('airline', 'Bilinmiyor')}"
+        )
+
+        departure = result.get(
+            "departure",
+            ""
+        )
+
+        ret = result.get(
+            "return",
+            ""
+        )
+
+        lines.append(
+            f"📅 {departure} → {ret}"
+        )
+
+        stops = result.get(
+            "stops"
+        )
+
+        if stops == 0:
+
+            lines.append(
+                "🟢 Direkt uçuş"
+            )
+
+        elif stops is not None:
+
+            lines.append(
+                f"🔄 {stops} aktarma"
+            )
+
+        else:
+
+            lines.append(
+                "🔄 Aktarma bilgisi: "
+                "belirlenemedi"
+            )
+
+        transfer = result.get(
+            "transfer"
+        )
+
+        if transfer:
+
+            lines.append(
+                f"📍 Aktarma: {transfer}"
+            )
+
+        duration = result.get(
+            "duration"
+        )
+
+        if duration:
+
+            lines.append(
+                f"⏱ Süre: "
+                f"{format_duration(duration)}"
+            )
+
+        baggage = result.get(
+            "baggage"
+        )
+
+        if baggage:
+
+            lines.append(
+                f"🧳 Bagaj: {baggage}"
+            )
+
+        # Fiyat geçmişi
+        change = result.get(
+            "price_change"
+        )
+
+        if change:
+
+            if change["status"] == "new":
+
+                lines.append(
+                    "🆕 Fiyat geçmişi için ilk kayıt"
+                )
+
+            elif change["difference"] < 0:
+
+                lines.append(
+                    f"📉 *Fiyat düştü:* "
+                    f"{money_text(abs(change['difference']))} "
+                    f"(%{abs(change['percentage']):.1f})"
+                )
+
+            elif change["difference"] > 0:
+
+                lines.append(
+                    f"📈 *Fiyat arttı:* "
+                    f"{money_text(change['difference'])} "
+                    f"(%{change['percentage']:.1f})"
+                )
+
+            else:
+
+                lines.append(
+                    "➡️ Fiyat değişmedi."
+                )
+
+        lines.append(
+            f"🔗 [Uçuşu görüntüle]"
+            f"({result.get('search_url', result.get('url', ''))})"
+        )
+
+        lines.append(
+            "━━━━━━━━━━━━━━━━━━━━"
+        )
+
+    # ========================================================
+    # EN UCUZ
+    # ========================================================
+
+    cheapest = min(
+        results,
+        key=lambda x: x["price"]
+    )
+
+    lines.append("")
+
+    lines.append(
+        "🏆 *BUGÜNÜN EN UCUZ SEÇENEĞİ*"
+    )
+
+    lines.append(
+        f"💰 {money_text(cheapest['price'])}"
+    )
+
+    lines.append(
+        f"🛫 {cheapest['origin']} → "
+        f"{cheapest['destination']}"
+    )
+
+    lines.append(
+        f"🏷 {cheapest.get('airline', 'Bilinmiyor')}"
+    )
+
+    lines.append(
+        f"📅 {cheapest['departure']} → "
+        f"{cheapest['return']}"
+    )
+
+    # ========================================================
+    # EN İYİ 3
+    # ========================================================
+
+    lines.append("")
+
+    lines.append(
+        "⭐ *ÇOCUKLARLA SEYAHAT İÇİN EN MANTIKLI 3 SEÇENEK*"
+    )
+
+    # Puanlama zaten fiyat + aktarma + süre
+    # şeklinde yapılıyor.
+
+    for i, result in enumerate(
+        results[:3],
+        1
+    ):
+
+        lines.append(
+            f"{i}. "
+            f"{money_text(result['price'])} — "
+            f"{result['origin']} → "
+            f"{result['destination']} — "
+            f"{result.get('airline', 'Bilinmiyor')}"
+        )
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# 19. AKTARMALI RAPOR
+# ============================================================
+
+def build_connection_report(results):
+
+    connection_results = [
+        x for x in results
+        if x.get("stops") is not None
+        and x.get("stops") > 0
+    ]
+
+    if not connection_results:
+
+        return (
+            "\n\n🔄 *AKTARMALI UÇUŞLAR*\n\n"
+            "Bu çalıştırmada ayrıntılı aktarmalı "
+            "uçuş bilgisi okunamadı.\n"
+            "Debug kayıtları flight_data/debug "
+            "klasöründe."
+        )
+
+    connection_results.sort(
+        key=lambda x: x["price"]
+    )
+
+    lines = []
+
+    lines.append("")
+    lines.append("")
+    lines.append(
+        "🌍 *YURTDIŞI / AKTARMALI SEÇENEKLER*"
+    )
+
+    lines.append(
+        "Özellikle ucuz aktarmalı seçenekler:"
+    )
+
+    lines.append("")
+
+    for result in connection_results[:10]:
+
+        lines.append(
+            f"✈️ *{result['origin']} → "
+            f"{result['destination']}*"
+        )
+
+        lines.append(
+            f"💰 {money_text(result['price'])}"
+        )
+
+        lines.append(
+            f"🏷 {result.get('airline', 'Bilinmiyor')}"
+        )
+
+        lines.append(
+            f"🔄 {result['stops']} aktarma"
+        )
+
+        if result.get("transfer"):
+
+            lines.append(
+                f"📍 {result['transfer']}"
+            )
+
+        if result.get("duration"):
+
+            lines.append(
+                f"⏱ {format_duration(result['duration'])}"
+            )
+
+        lines.append(
+            f"🔗 [Detay]({result['search_url']})"
+        )
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# 20. TARİH KARŞILAŞTIRMA RAPORU
+# ============================================================
+
+def build_date_report(results):
+
+    grouped = {}
+
+    for result in results:
+
+        key = (
+            result["departure"],
+            result["return"]
+        )
+
+        if key not in grouped:
+            grouped[key] = []
+
+        grouped[key].append(
+            result
+        )
+
+    lines = []
+
+    lines.append("")
+    lines.append(
+        "📅 *TARİH KARŞILAŞTIRMASI*"
+    )
+
+    lines.append("")
+
+    date_best = []
+
+    for dates, items in grouped.items():
+
+        if not items:
+            continue
+
+        cheapest = min(
+            items,
+            key=lambda x: x["price"]
+        )
+
+        date_best.append(
+            (
+                cheapest["price"],
+                dates,
+                cheapest
+            )
+        )
+
+    date_best.sort(
+        key=lambda x: x[0]
+    )
+
+    for price, dates, result in date_best[:10]:
+
+        departure, return_date = dates
+
+        lines.append(
+            f"📅 {departure} → {return_date}"
+        )
+
+        lines.append(
+            f"💰 {money_text(price)}"
+        )
+
+        lines.append(
+            f"🛫 {result['origin']}"
+        )
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# 21. TELEGRAM GÖNDER
+# ============================================================
+
+async def send_telegram(text):
+
+    bot = Bot(
+        token=TELEGRAM_TOKEN
+    )
+
+    # Telegram maksimum mesaj uzunluğu
+    # yaklaşık 4096 karakter.
+
+    chunks = []
+
+    while len(text) > 3900:
+
+        cut = text.rfind(
+            "\n",
+            0,
+            3900
+        )
+
+        if cut < 500:
+            cut = 3900
+
+        chunks.append(
+            text[:cut]
+        )
+
+        text = text[cut:]
+
+    if text:
+        chunks.append(text)
+
+    for chunk in chunks:
+
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=chunk,
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+
+        await asyncio.sleep(1)
+
+
+# ============================================================
+# 22. JSON SONUÇ KAYDI
+# ============================================================
+
+def save_last_results(results):
+
+    save_json(
+        LAST_RESULTS_FILE,
+        {
+            "checked_at": now_string(),
+            "count": len(results),
+            "results": results
+        }
+    )
+
+
+# ============================================================
+# 23. ANA PROGRAM
+# ============================================================
+
+async def main():
+
+    if not TELEGRAM_TOKEN:
+
+        raise RuntimeError(
+            "TELEGRAM_TOKEN environment variable bulunamadı."
+        )
+
+    if not TELEGRAM_CHAT_ID:
+
+        raise RuntimeError(
+            "TELEGRAM_CHAT_ID environment variable bulunamadı."
+        )
+
+    print("")
+    print(
+        "=========================================="
+    )
+    print(
+        " PARİS UÇUŞ ARAŞTIRMA V2"
+    )
+    print(
+        "=========================================="
+    )
+
+    print(
+        "Ana tarih:",
+        MAIN_DEPARTURE,
+        "→",
+        MAIN_RETURN
+    )
+
+    print(
+        "Gidiş alternatifleri:",
+        DEPARTURE_DATES
+    )
+
+    print(
+        "Dönüş alternatifleri:",
+        RETURN_DATES
+    )
+
+    print("")
+
+    # ========================================================
+    # ARAŞTIR
+    # ========================================================
+
+    results = await research()
+
+    print(
+        f"Toplam ham sonuç: {len(results)}"
+    )
+
+    # ========================================================
+    # TEMİZLE
+    # ========================================================
+
+    results = clean_results(
+        results
+    )
+
+    print(
+        f"Temizlenmiş sonuç: {len(results)}"
+    )
+
+    # ========================================================
+    # GEÇMİŞ
+    # ========================================================
+
+    results = process_history(
+        results
+    )
+
+    # ========================================================
+    # KAYDET
+    # ========================================================
+
+    save_last_results(
+        results
+    )
+
+    # ========================================================
+    # RAPORLAR
+    # ========================================================
+
+    main_report = build_report(
+        results
+    )
+
+    connection_report = build_connection_report(
+        results
+    )
+
+    date_report = build_date_report(
+        results
+    )
+
+    final_report = (
+        main_report
+        + connection_report
+        + date_report
+    )
+
+    # ========================================================
+    # TELEGRAM
+    # ========================================================
+
+    await send_telegram(
+        final_report
+    )
+
+    print("")
+    print(
+        "✅ Telegram raporu gönderildi."
+    )
+
+    print(
+        "=========================================="
+    )
+
+
+# ============================================================
+# ÇALIŞTIR
+# ============================================================
+
+if __name__ == "__main__":
+
+    asyncio.run(
+        main()
+    )
